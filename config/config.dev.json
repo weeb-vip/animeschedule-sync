@@ -1,0 +1,14 @@
+{
+  "dbconfig": {
+    "host": "localhost",
+    "user": "weeb",
+    "password": "mysecretpassword",
+    "database": "weeb",
+    "port": 3306
+  },
+  "animescheduleconfig": {
+    "baseurl": "https://animeschedule.net/api/v3",
+    "token": "",
+    "syncinterval": "60m"
+  }
+}
