@@ -92,8 +92,11 @@ func (c *Client) FetchTimetable(ctx context.Context) ([]TimetableEntry, error) {
 	return entries, nil
 }
 
-// FetchAnimeByMalIDs fetches anime details by MAL IDs (no auth needed)
-func (c *Client) FetchAnimeByMalIDs(ctx context.Context, malIDs []int) ([]AnimeEntry, error) {
+// FetchAnimeBySeason fetches all anime for a season route (e.g. "summer-2026"),
+// paginating through the results. AnimeSchedule's /anime endpoint only accepts a
+// single mal-id per request (multiple mal-ids 404), so we pull the whole season
+// — each entry carries its MAL id and streams — and match by MAL id upstream.
+func (c *Client) FetchAnimeBySeason(ctx context.Context, season string) ([]AnimeEntry, error) {
 	log := logger.FromCtx(ctx)
 
 	var allAnime []AnimeEntry
@@ -106,9 +109,7 @@ func (c *Client) FetchAnimeByMalIDs(ctx context.Context, malIDs []int) ([]AnimeE
 		}
 
 		q := u.Query()
-		for _, id := range malIDs {
-			q.Add("mal-ids", strconv.Itoa(id))
-		}
+		q.Set("seasons", season)
 		q.Set("page", strconv.Itoa(page))
 		u.RawQuery = q.Encode()
 
@@ -119,7 +120,7 @@ func (c *Client) FetchAnimeByMalIDs(ctx context.Context, malIDs []int) ([]AnimeE
 
 		body, err := c.doRequest(ctx, req)
 		if err != nil {
-			return nil, fmt.Errorf("fetching anime by MAL IDs (page %d): %w", page, err)
+			return nil, fmt.Errorf("fetching anime for season %s (page %d): %w", season, page, err)
 		}
 
 		var resp AnimeSearchResponse
@@ -129,7 +130,8 @@ func (c *Client) FetchAnimeByMalIDs(ctx context.Context, malIDs []int) ([]AnimeE
 
 		allAnime = append(allAnime, resp.Anime...)
 
-		log.Info("Fetched anime page",
+		log.Info("Fetched season page",
+			zap.String("season", season),
 			zap.Int("page", page),
 			zap.Int("count", len(resp.Anime)),
 			zap.Int("total", resp.TotalAmount),
