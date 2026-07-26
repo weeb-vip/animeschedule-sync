@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"strconv"
 	"time"
@@ -70,49 +71,70 @@ func (s *SyncService) RunFullSync(ctx context.Context) error {
 func (s *SyncService) SyncAnimeDetails(ctx context.Context) error {
 	log := logger.FromCtx(ctx)
 
-	animes, err := s.animeRepo.FindCurrentlyAiringWithMalID()
-	if err != nil {
-		return fmt.Errorf("finding airing anime: %w", err)
+	// AnimeSchedule-first: pull its season listings (current + a few prior
+	// seasons, so carryover / split-cour shows that premiered earlier are still
+	// covered) and match each entry to what we already have by MAL id. Our own
+	// anime_seasons classification is intentionally not consulted.
+	seasons := seasonRoutes(time.Now(), seasonsLookback())
+	log.Info("Fetching AnimeSchedule seasons", zap.Strings("seasons", seasons))
+
+	var entries []animeschedule.AnimeEntry
+	for _, season := range seasons {
+		e, err := s.client.FetchAnimeBySeason(ctx, season)
+		if err != nil {
+			// Skip this season but keep going — one bad season shouldn't abort the sync.
+			log.Error("Failed to fetch season, skipping", zap.String("season", season), zap.Error(err))
+			continue
+		}
+		log.Info("Fetched season anime from AnimeSchedule", zap.String("season", season), zap.Int("count", len(e)))
+		entries = append(entries, e...)
+	}
+	if len(entries) == 0 {
+		log.Info("No season entries fetched from AnimeSchedule")
+		return nil
 	}
 
-	log.Info("Found airing anime with MAL IDs", zap.Int("count", len(animes)))
+	// Extract each entry's MAL id, then batch-look-up the ones we actually have.
+	type entryMatch struct {
+		entry animeschedule.AnimeEntry
+		malID int
+	}
+	var candidates []entryMatch
+	malIDSet := make(map[int]struct{})
+	for _, entry := range entries {
+		malID, ok := parseMalID(entry.Websites.MAL)
+		if !ok {
+			continue
+		}
+		candidates = append(candidates, entryMatch{entry: entry, malID: malID})
+		malIDSet[malID] = struct{}{}
+	}
 
-	// Map our airing anime by MAL id so AnimeSchedule's season list can be matched
-	// back to our records.
-	malIDToAnimeID := make(map[int]string)
-	for _, a := range animes {
+	malIDs := make([]int, 0, len(malIDSet))
+	for id := range malIDSet {
+		malIDs = append(malIDs, id)
+	}
+
+	ours, err := s.animeRepo.FindByMalIDs(malIDs)
+	if err != nil {
+		return fmt.Errorf("looking up anime by MAL ids: %w", err)
+	}
+	malIDToAnimeID := make(map[int]string, len(ours))
+	for _, a := range ours {
 		if a.MalID != nil {
 			malIDToAnimeID[*a.MalID] = a.ID
 		}
 	}
 
-	if len(malIDToAnimeID) == 0 {
-		log.Info("No anime with MAL IDs to sync")
-		return nil
-	}
-
-	// AnimeSchedule's /anime endpoint 404s on multi mal-id lookups, but serves a
-	// whole season at once (each entry carries its MAL id, air times, and streams),
-	// so fetch the current season and match by MAL id.
-	season := seasonRoute(time.Now())
-	log.Info("Fetching AnimeSchedule season", zap.String("season", season))
-
-	entries, err := s.client.FetchAnimeBySeason(ctx, season)
-	if err != nil {
-		return fmt.Errorf("fetching season anime: %w", err)
-	}
-	log.Info("Fetched season anime from AnimeSchedule", zap.Int("count", len(entries)))
-
 	matched := 0
-	for _, entry := range entries {
-		// Match by MAL URL to find our anime ID; skip AnimeSchedule anime we don't have.
-		animeID := s.matchAnimeID(entry, malIDToAnimeID)
-		if animeID == "" {
-			continue
+	for _, c := range candidates {
+		animeID, ok := malIDToAnimeID[c.malID]
+		if !ok {
+			continue // AnimeSchedule has it, we don't — skip.
 		}
 		matched++
 
-		if err := s.upsertAnimeSchedule(animeID, entry); err != nil {
+		if err := s.upsertAnimeSchedule(animeID, c.entry); err != nil {
 			log.Error("Failed to upsert anime schedule",
 				zap.String("animeID", animeID),
 				zap.Error(err),
@@ -120,16 +142,61 @@ func (s *SyncService) SyncAnimeDetails(ctx context.Context) error {
 			continue
 		}
 
-		if err := s.upsertStreamingPlatforms(animeID, entry.Websites.Streams); err != nil {
+		if err := s.upsertStreamingPlatforms(animeID, c.entry.Websites.Streams); err != nil {
 			log.Error("Failed to upsert streaming platforms",
 				zap.String("animeID", animeID),
 				zap.Error(err),
 			)
 		}
 	}
-	log.Info("Synced anime schedules", zap.Int("matched", matched), zap.Int("season_anime", len(entries)))
+	log.Info("Synced anime schedules",
+		zap.Int("season_entries", len(entries)),
+		zap.Int("with_mal_id", len(candidates)),
+		zap.Int("in_our_db", len(malIDToAnimeID)),
+		zap.Int("matched", matched),
+	)
 
 	return nil
+}
+
+// seasonsLookback is how many seasons BEFORE the current one to also fetch, so
+// carryover / split-cour shows (which AnimeSchedule lists under their premiere
+// season) still get enriched. Configurable via ANIMESCHEDULE_SEASONS_LOOKBACK
+// (default 2 = current + 2 prior seasons).
+func seasonsLookback() int {
+	if v := os.Getenv("ANIMESCHEDULE_SEASONS_LOOKBACK"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 2
+}
+
+// seasonRoutes returns AnimeSchedule season routes for the current season plus
+// `lookback` prior seasons, e.g. ["summer-2026", "spring-2026", "winter-2026"].
+func seasonRoutes(t time.Time, lookback int) []string {
+	routes := make([]string, 0, lookback+1)
+	for i := 0; i <= lookback; i++ {
+		routes = append(routes, seasonRoute(t.AddDate(0, -3*i, 0)))
+	}
+	return routes
+}
+
+// parseMalID extracts the MyAnimeList id from a MAL URL like
+// https://myanimelist.net/anime/12345/Title.
+func parseMalID(malURL string) (int, bool) {
+	if malURL == "" {
+		return 0, false
+	}
+	matches := malIDRegex.FindStringSubmatch(malURL)
+	if len(matches) < 2 {
+		return 0, false
+	}
+	id, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return 0, false
+	}
+	return id, true
 }
 
 // seasonRoute returns the AnimeSchedule season route for the given time, e.g.
@@ -221,21 +288,6 @@ func (s *SyncService) SyncTimetable(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-// matchAnimeID extracts the MAL ID from the AnimeSchedule entry and maps it to our anime ID
-func (s *SyncService) matchAnimeID(entry animeschedule.AnimeEntry, malIDToAnimeID map[int]string) string {
-	if entry.Websites.MAL != "" {
-		matches := malIDRegex.FindStringSubmatch(entry.Websites.MAL)
-		if len(matches) >= 2 {
-			if id, err := strconv.Atoi(matches[1]); err == nil {
-				if animeID, ok := malIDToAnimeID[id]; ok {
-					return animeID
-				}
-			}
-		}
-	}
-	return ""
 }
 
 func (s *SyncService) upsertAnimeSchedule(animeID string, entry animeschedule.AnimeEntry) error {

@@ -1,32 +1,11 @@
 package anime
 
 import (
-	"fmt"
-	"time"
-
 	"github.com/weeb-vip/animeschedule-sync/internal/db"
 )
 
-// currentSeason returns the season key stored in anime_seasons.season for the
-// given time, e.g. "SUMMER_2026". Seasons: Winter=Jan-Mar, Spring=Apr-Jun,
-// Summer=Jul-Sep, Fall=Oct-Dec.
-func currentSeason(t time.Time) string {
-	var s string
-	switch t.Month() {
-	case time.January, time.February, time.March:
-		s = "WINTER"
-	case time.April, time.May, time.June:
-		s = "SPRING"
-	case time.July, time.August, time.September:
-		s = "SUMMER"
-	default:
-		s = "FALL"
-	}
-	return fmt.Sprintf("%s_%d", s, t.Year())
-}
-
 type AnimeRepositoryImpl interface {
-	FindCurrentlyAiringWithMalID() ([]Anime, error)
+	FindByMalIDs(malIDs []int) ([]Anime, error)
 	FindByMalID(malID int) (*Anime, error)
 	UpdateMalID(id string, malID int) error
 }
@@ -39,15 +18,17 @@ func NewAnimeRepository(db *db.DB) AnimeRepositoryImpl {
 	return &AnimeRepository{db: db}
 }
 
-func (r *AnimeRepository) FindCurrentlyAiringWithMalID() ([]Anime, error) {
+// FindByMalIDs returns the anime we already have for the given MAL ids (batch
+// lookup). This drives the AnimeSchedule-first sync: we pull a season's entries
+// from AnimeSchedule and match them to what we have by MAL id, so our own
+// anime_seasons classification no longer gates which anime get enriched (which
+// previously dropped carryover / split-cour shows).
+func (r *AnimeRepository) FindByMalIDs(malIDs []int) ([]Anime, error) {
 	var animes []Anime
-	season := currentSeason(time.Now())
-	err := r.db.DB.
-		Select("anime.*").
-		Joins("JOIN anime_seasons ON anime_seasons.anime_id = anime.id").
-		Where("anime.mal_id IS NOT NULL").
-		Where("anime_seasons.season = ?", season).
-		Find(&animes).Error
+	if len(malIDs) == 0 {
+		return animes, nil
+	}
+	err := r.db.DB.Where("mal_id IN ?", malIDs).Find(&animes).Error
 	return animes, err
 }
 
