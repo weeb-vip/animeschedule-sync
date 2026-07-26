@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -76,62 +77,76 @@ func (s *SyncService) SyncAnimeDetails(ctx context.Context) error {
 
 	log.Info("Found airing anime with MAL IDs", zap.Int("count", len(animes)))
 
-	// Batch MAL IDs (API returns 18 per page)
-	var malIDs []int
+	// Map our airing anime by MAL id so AnimeSchedule's season list can be matched
+	// back to our records.
 	malIDToAnimeID := make(map[int]string)
 	for _, a := range animes {
 		if a.MalID != nil {
-			malIDs = append(malIDs, *a.MalID)
 			malIDToAnimeID[*a.MalID] = a.ID
 		}
 	}
 
-	if len(malIDs) == 0 {
+	if len(malIDToAnimeID) == 0 {
 		log.Info("No anime with MAL IDs to sync")
 		return nil
 	}
 
-	// Fetch in batches of 18
-	batchSize := 18
-	for i := 0; i < len(malIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(malIDs) {
-			end = len(malIDs)
-		}
-		batch := malIDs[i:end]
+	// AnimeSchedule's /anime endpoint 404s on multi mal-id lookups, but serves a
+	// whole season at once (each entry carries its MAL id, air times, and streams),
+	// so fetch the current season and match by MAL id.
+	season := seasonRoute(time.Now())
+	log.Info("Fetching AnimeSchedule season", zap.String("season", season))
 
-		entries, err := s.client.FetchAnimeByMalIDs(ctx, batch)
-		if err != nil {
-			log.Error("Failed to fetch anime batch", zap.Error(err))
+	entries, err := s.client.FetchAnimeBySeason(ctx, season)
+	if err != nil {
+		return fmt.Errorf("fetching season anime: %w", err)
+	}
+	log.Info("Fetched season anime from AnimeSchedule", zap.Int("count", len(entries)))
+
+	matched := 0
+	for _, entry := range entries {
+		// Match by MAL URL to find our anime ID; skip AnimeSchedule anime we don't have.
+		animeID := s.matchAnimeID(entry, malIDToAnimeID)
+		if animeID == "" {
+			continue
+		}
+		matched++
+
+		if err := s.upsertAnimeSchedule(animeID, entry); err != nil {
+			log.Error("Failed to upsert anime schedule",
+				zap.String("animeID", animeID),
+				zap.Error(err),
+			)
 			continue
 		}
 
-		for _, entry := range entries {
-			// Match by MAL URL to find our anime ID
-			animeID := s.matchAnimeID(entry, malIDToAnimeID)
-			if animeID == "" {
-				log.Debug("Could not match anime", zap.String("title", entry.Title))
-				continue
-			}
-
-			if err := s.upsertAnimeSchedule(animeID, entry); err != nil {
-				log.Error("Failed to upsert anime schedule",
-					zap.String("animeID", animeID),
-					zap.Error(err),
-				)
-				continue
-			}
-
-			if err := s.upsertStreamingPlatforms(animeID, entry.Websites.Streams); err != nil {
-				log.Error("Failed to upsert streaming platforms",
-					zap.String("animeID", animeID),
-					zap.Error(err),
-				)
-			}
+		if err := s.upsertStreamingPlatforms(animeID, entry.Websites.Streams); err != nil {
+			log.Error("Failed to upsert streaming platforms",
+				zap.String("animeID", animeID),
+				zap.Error(err),
+			)
 		}
 	}
+	log.Info("Synced anime schedules", zap.Int("matched", matched), zap.Int("season_anime", len(entries)))
 
 	return nil
+}
+
+// seasonRoute returns the AnimeSchedule season route for the given time, e.g.
+// "summer-2026". Winter=Jan-Mar, Spring=Apr-Jun, Summer=Jul-Sep, Fall=Oct-Dec.
+func seasonRoute(t time.Time) string {
+	var s string
+	switch t.Month() {
+	case time.January, time.February, time.March:
+		s = "winter"
+	case time.April, time.May, time.June:
+		s = "spring"
+	case time.July, time.August, time.September:
+		s = "summer"
+	default:
+		s = "fall"
+	}
+	return fmt.Sprintf("%s-%d", s, t.Year())
 }
 
 // SyncTimetable fetches the weekly timetable and stores precise episode air times
