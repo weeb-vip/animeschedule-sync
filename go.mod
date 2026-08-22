@@ -1,6 +1,6 @@
 module github.com/weeb-vip/animeschedule-sync
 
-go 1.25
+go 1.23
 
 require (
 	github.com/jinzhu/configor v1.2.1
