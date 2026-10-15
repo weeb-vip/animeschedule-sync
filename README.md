@@ -27,6 +27,7 @@ Requires Go 1.23.
 
 ```sh
 make sync     # one-shot full sync from the API, then exit
+./animeschedule-sync backfill-streaming --from-year 1960  # streaming links for every season, once
 make serve    # run the sync on a recurring interval
 make build    # build ./animeschedule-sync
 ```
