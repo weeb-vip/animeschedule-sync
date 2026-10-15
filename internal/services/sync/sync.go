@@ -353,8 +353,17 @@ func (s *SyncService) upsertStreamingPlatforms(animeID string, streams []animesc
 		return nil
 	}
 
+	// The table is keyed on (anime_id, platform), and Postgres rejects an
+	// upsert that touches the same key twice, which dropped every link for a
+	// show that lists one platform twice (e.g. two regional Crunchyroll URLs).
+	// Keep the first entry per platform.
+	seen := make(map[string]struct{}, len(streams))
 	var platforms []anime_streaming.AnimeStreamingPlatform
 	for _, stream := range streams {
+		if _, dup := seen[stream.Platform]; dup {
+			continue
+		}
+		seen[stream.Platform] = struct{}{}
 		name := stream.Name
 		platforms = append(platforms, anime_streaming.AnimeStreamingPlatform{
 			AnimeID:  animeID,
